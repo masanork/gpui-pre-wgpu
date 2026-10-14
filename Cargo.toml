@@ -34,6 +34,12 @@ zed-rev = "bcf6582ce3500df93a8a39366640173e6786cea6"
 [features]
 default = []
 font-kit = ["dep:font-kit"]
+# WgpuHeadlessRenderer (added by ibis inc. for ibisOffice): GPUI's headless
+# renderer trait is part of its test support.
+test-support = [
+    "gpui/test-support",
+    "dep:image",
+]
 
 [lib]
 name = "gpui_wgpu"
@@ -114,6 +120,11 @@ version = "1.10"
 
 [dependencies.wgpu]
 version = "29.0.4"
+
+[dependencies.image]
+version = "0.25.1"
+default-features = false
+optional = true
 
 [target.'cfg(target_family = "wasm")'.dependencies.web-sys]
 version = "0.3"

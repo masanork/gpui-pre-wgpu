@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-10-14): exports `WgpuHeadlessRenderer`.
 mod cosmic_text_system;
 mod wgpu_atlas;
 mod wgpu_context;
@@ -8,3 +9,5 @@ pub use wgpu;
 pub use wgpu_atlas::*;
 pub use wgpu_context::*;
 pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+pub use wgpu_renderer::WgpuHeadlessRenderer;

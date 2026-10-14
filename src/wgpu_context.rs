@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-10-14): added `WgpuContext::new_headless` (a device without a window).
 #[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 #[cfg(not(target_family = "wasm"))]
@@ -139,6 +140,69 @@ impl WgpuContext {
             color_texture_format,
             device_lost,
         })
+    }
+
+    /// A context with no window or surface, for drawing into textures
+    /// (`WgpuHeadlessRenderer`): the first adapter, in the order windows
+    /// choose them, that gives a device. A software adapter (such as
+    /// lavapipe) is taken when there is no other.
+    ///
+    /// Added in ibisOffice's fork of gpui-pre-wgpu 0.3.6.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_headless() -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        let mut adapters: Vec<_> = gpui::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        adapters.sort_by_key(|adapter| {
+            let info = adapter.get_info();
+            let type_priority: u8 = match info.device_type {
+                wgpu::DeviceType::DiscreteGpu => 0,
+                wgpu::DeviceType::IntegratedGpu => 1,
+                wgpu::DeviceType::Other => 2,
+                wgpu::DeviceType::VirtualGpu => 3,
+                wgpu::DeviceType::Cpu => 4,
+            };
+            let backend_priority: u8 = match info.backend {
+                wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12 => 0,
+                _ => 1,
+            };
+            (type_priority, backend_priority)
+        });
+        for adapter in adapters {
+            let info = adapter.get_info();
+            match gpui::block_on(Self::create_device(&adapter)) {
+                Ok((device, queue, dual_source_blending, color_texture_format)) => {
+                    log::info!("Headless GPU adapter: {:?} ({:?})", info.name, info.backend);
+                    let device_lost = Arc::new(AtomicBool::new(false));
+                    device.set_device_lost_callback({
+                        let device_lost = Arc::clone(&device_lost);
+                        move |reason, message| {
+                            log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                            if reason != wgpu::DeviceLostReason::Destroyed {
+                                device_lost.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                    return Ok(Self {
+                        instance,
+                        backend: WgpuBackend::Native(info.backend),
+                        adapter,
+                        device: Arc::new(device),
+                        queue: Arc::new(queue),
+                        dual_source_blending,
+                        color_texture_format,
+                        device_lost,
+                    });
+                }
+                Err(e) => log::info!("Adapter {} ({:?}) failed: {e}", info.name, info.backend),
+            }
+        }
+        anyhow::bail!("No GPU adapter could create a device")
     }
 
     #[cfg(target_family = "wasm")]
