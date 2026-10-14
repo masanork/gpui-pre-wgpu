@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-10-14): implemented `PlatformTextSystem::font_data`.
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
@@ -59,6 +60,9 @@ struct CosmicTextSystemState {
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
     missing_glyph_sink: Option<Arc<dyn MissingGlyphSink>>,
+    /// Font files copied for `font_data`, by the address of the data the
+    /// font database holds (one copy for all the faces of a collection).
+    font_files: HashMap<usize, Arc<Vec<u8>>>,
 }
 
 struct LoadedFont {
@@ -141,6 +145,7 @@ impl CosmicTextSystem {
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
+            font_files: HashMap::default(),
         }))
     }
 
@@ -160,6 +165,7 @@ impl CosmicTextSystem {
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
+            font_files: HashMap::default(),
         }))
     }
 }
@@ -235,6 +241,19 @@ impl PlatformTextSystem for CosmicTextSystem {
                 size: size(metrics.max_width, metrics.ascent + metrics.descent),
             },
         }
+    }
+
+    fn font_data(&self, font_id: FontId) -> Option<(Arc<Vec<u8>>, u32)> {
+        let mut state = self.0.write();
+        let font = state.loaded_fonts.get(font_id.0)?.font.clone();
+        let index = state.font_system.db().face(font.id())?.index;
+        let bytes = font.data();
+        let data = state
+            .font_files
+            .entry(bytes.as_ptr() as usize)
+            .or_insert_with(|| Arc::new(bytes.to_vec()))
+            .clone();
+        Some((data, index))
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
