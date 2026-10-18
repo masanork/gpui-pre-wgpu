@@ -1,4 +1,6 @@
 // Modified by ibis inc. for ibisOffice (2026-10-14): implemented `PlatformTextSystem::font_data`.
+// Modified by ibis inc. for ibisOffice (2026-10-18): the system's locale is given to cosmic-text as the language alone
+// (`ja-JP` → `ja`), so that kanji not in a font are drawn in the Japanese font, not the Simplified Chinese one.
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
@@ -134,6 +136,13 @@ impl CosmicTextSystem {
 
     pub fn new(system_font_fallback: &str) -> Self {
         let font_system = FontSystem::new();
+        let font_system = match han_locale(font_system.locale()) {
+            Some(locale) => {
+                let (_, db) = font_system.into_locale_and_db();
+                FontSystem::new_with_locale_and_db(locale, db)
+            }
+            None => font_system,
+        };
 
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
@@ -1767,5 +1776,41 @@ mod tests {
         let covers = |_: FontId, _: char| true;
         let spans = compute_run_spans("anything", 3, 0, primary, &fb, &covers);
         assert!(spans.is_empty());
+    }
+}
+
+/// The locale cosmic-text's fallback for Han characters understands, for a
+/// system locale it does not: it matches `ja`, `ko`, `zh-HK` and `zh-TW`
+/// exactly, so `ja-JP` (or `ja_JP.UTF-8`) took the Simplified Chinese font.
+/// `None` when the locale needs no change.
+fn han_locale(locale: &str) -> Option<String> {
+    let normalized = locale.split('.').next().unwrap_or(locale).replace('_', "-");
+    let mut parts = normalized.split('-');
+    let language = parts.next().unwrap_or("").to_ascii_lowercase();
+    let region = parts.last().unwrap_or("").to_ascii_uppercase();
+    let wanted = match (language.as_str(), region.as_str()) {
+        ("ja", _) => "ja",
+        ("ko", _) => "ko",
+        ("zh", "HK" | "MO") => "zh-HK",
+        ("zh", "TW") => "zh-TW",
+        _ => return None,
+    };
+    (locale != wanted).then(|| wanted.to_string())
+}
+
+#[cfg(test)]
+mod han_locale_tests {
+    use super::han_locale;
+
+    #[test]
+    fn languages_with_a_region_are_given_alone() {
+        assert_eq!(han_locale("ja-JP").as_deref(), Some("ja"));
+        assert_eq!(han_locale("ja_JP.UTF-8").as_deref(), Some("ja"));
+        assert_eq!(han_locale("ja"), None);
+        assert_eq!(han_locale("ko-KR").as_deref(), Some("ko"));
+        assert_eq!(han_locale("zh-Hant-TW").as_deref(), Some("zh-TW"));
+        assert_eq!(han_locale("zh-HK"), None);
+        assert_eq!(han_locale("zh-CN"), None);
+        assert_eq!(han_locale("en-US"), None);
     }
 }
