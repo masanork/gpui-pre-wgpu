@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, TexturedQuad, get_gamma_correction_ratios,
+    ScaledPixels, Scene, Size, TexturedMesh, TexturedQuad, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -105,6 +105,28 @@ struct TexturedQuadParams {
     pad: [u32; 1],
 }
 
+/// A vertex of a mesh as the vertex buffer holds it (32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MeshVertexGpu {
+    position: [f32; 3],
+    pad0: f32,
+    uv: [f32; 2],
+    pad1: [f32; 2],
+}
+
+/// One `TexturedMesh` as the shader's uniform block (96 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TexturedMeshParams {
+    transform: [f32; 16],
+    content_mask: [f32; 4],
+    opacity: f32,
+    shade: f32,
+    flags: u32,
+    pad: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GammaParams {
@@ -154,6 +176,9 @@ struct WgpuPipelines {
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
     textured_quads: wgpu::RenderPipeline,
+    /// For triangle meshes: drawing both faces, and only the front.
+    textured_meshes: wgpu::RenderPipeline,
+    textured_meshes_culled: wgpu::RenderPipeline,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -182,6 +207,7 @@ struct WgpuBindGroupLayouts {
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
     textured_quads: wgpu::BindGroupLayout,
+    textured_meshes: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -843,12 +869,27 @@ impl WgpuRenderer {
             }],
         });
 
+        let textured_meshes = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("textured_meshes_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<TexturedMeshParams>() as u64),
+                },
+                count: None,
+            }],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             texture,
             surfaces,
             textured_quads,
+            textured_meshes,
         }
     }
 
@@ -1184,6 +1225,59 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        // Triangle meshes: the vertices come from a vertex buffer (WebGL2 has no storage buffers), the triangles from an index buffer.
+        let mesh_pipeline = |name: &str, cull: Option<wgpu::Face>| {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{name}_layout")),
+                bind_group_layouts: &[Some(&layouts.globals), Some(&layouts.textured_meshes), Some(&layouts.texture)],
+                immediate_size: 0,
+            });
+            let vertex_attributes = [
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 16, shader_location: 1 },
+            ];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(name),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_textured_mesh"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 32,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &vertex_attributes,
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: Some("fs_textured_mesh"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    // A front triangle is clockwise on the screen.
+                    front_face: wgpu::FrontFace::Cw,
+                    cull_mode: cull,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let textured_meshes = mesh_pipeline("textured_meshes", None);
+        let textured_meshes_culled = mesh_pipeline("textured_meshes_culled", Some(wgpu::Face::Back));
+
         WgpuPipelines {
             quads,
             shadows,
@@ -1195,6 +1289,8 @@ impl WgpuRenderer {
             poly_sprites,
             surfaces,
             textured_quads,
+            textured_meshes,
+            textured_meshes_culled,
         }
     }
 
@@ -1731,6 +1827,9 @@ impl WgpuRenderer {
                     PrimitiveBatch::TexturedQuads(range) => {
                         self.draw_textured_quads(&scene.textured_quads[range], &mut pass)
                     }
+                    PrimitiveBatch::TexturedMeshes(range) => {
+                        self.draw_textured_meshes(&scene.textured_meshes[range], &mut pass)
+                    }
                 }
             }
         }
@@ -1739,6 +1838,70 @@ impl WgpuRenderer {
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+
+    fn draw_textured_meshes(&self, meshes: &[TexturedMesh], pass: &mut wgpu::RenderPass<'_>) {
+        let resources = self.resources();
+        for mesh in meshes {
+            // A texture that was not painted in this frame draws nothing.
+            let Some(offscreen) = resources.offscreen_passes.get(&mesh.texture.0) else {
+                continue;
+            };
+            // The pass is drawn in the top left of its (window-sized) texture: the vertices' texture points, in that.
+            let (kx, ky) = (
+                offscreen.content.0 as f32 / offscreen.size.0.max(1) as f32,
+                offscreen.content.1 as f32 / offscreen.size.1.max(1) as f32,
+            );
+            let vertices: Vec<MeshVertexGpu> = mesh
+                .vertices
+                .iter()
+                .map(|v| MeshVertexGpu {
+                    position: v.position,
+                    pad0: 0.0,
+                    uv: [v.uv[0] * kx, v.uv[1] * ky],
+                    pad1: [0.0; 2],
+                })
+                .collect();
+            let mask = mesh.content_mask.bounds;
+            let params = TexturedMeshParams {
+                transform: mesh.transform,
+                content_mask: [mask.origin.x.0, mask.origin.y.0, mask.size.width.0, mask.size.height.0],
+                opacity: mesh.opacity,
+                shade: mesh.shade,
+                flags: mesh.flags,
+                pad: 0,
+            };
+            let make_buffer = |label: &str, usage: wgpu::BufferUsages, bytes: &[u8]| {
+                let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: bytes.len() as u64,
+                    usage: usage | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                resources.queue.write_buffer(&buffer, 0, bytes);
+                buffer
+            };
+            let vertex_buffer = make_buffer("mesh_vertices", wgpu::BufferUsages::VERTEX, bytemuck::cast_slice(&vertices));
+            let index_buffer = make_buffer("mesh_indices", wgpu::BufferUsages::INDEX, bytemuck::cast_slice(mesh.indices.as_slice()));
+            let params_buffer = make_buffer("mesh_params", wgpu::BufferUsages::UNIFORM, bytemuck::bytes_of(&params));
+            let params_group = resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("textured_mesh_bind_group"),
+                layout: &resources.bind_group_layouts.textured_meshes,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() }],
+            });
+            let texture = self.create_texture_bind_group("offscreen_texture_bind_group", &offscreen.view);
+            pass.set_pipeline(if mesh.flags & TexturedQuad::CULL_BACK != 0 {
+                &resources.pipelines.textured_meshes_culled
+            } else {
+                &resources.pipelines.textured_meshes
+            });
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &params_group, &[]);
+            pass.set_bind_group(2, &texture, &[]);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
+        }
     }
 
     fn draw_textured_quads(&self, quads: &[TexturedQuad], pass: &mut wgpu::RenderPass<'_>) {

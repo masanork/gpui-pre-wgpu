@@ -79,6 +79,54 @@ fn fs_textured_quad(input: TexturedQuadVarying) -> @location(0) vec4<f32> {
     return vec4<f32>(color.rgb * textured_quad.shade, color.a) * textured_quad.opacity;
 }
 
+// --- textured meshes (ibis: an offscreen texture on a triangle mesh through a 4x4 transform) --- //
+
+struct TexturedMeshParams {
+    // The transform, column-major.
+    column0: vec4<f32>,
+    column1: vec4<f32>,
+    column2: vec4<f32>,
+    column3: vec4<f32>,
+    // x, y, width, height
+    content_mask: vec4<f32>,
+    opacity: f32,
+    shade: f32,
+    flags: u32,
+    pad: u32,
+}
+
+@group(1) @binding(0) var<uniform> textured_mesh: TexturedMeshParams;
+
+struct TexturedMeshVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texture_position: vec2<f32>,
+}
+
+@vertex
+fn vs_textured_mesh(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>) -> TexturedMeshVarying {
+    let m = textured_mesh;
+    let clip = m.column0 * position.x + m.column1 * position.y + m.column2 * position.z + m.column3;
+    var out = TexturedMeshVarying();
+    out.position = vec4<f32>(
+        clip.x * 2.0 / globals.viewport_size.x - clip.w,
+        clip.w - clip.y * 2.0 / globals.viewport_size.y,
+        clip.w - 0.001,
+        clip.w);
+    out.texture_position = uv;
+    return out;
+}
+
+@fragment
+fn fs_textured_mesh(input: TexturedMeshVarying) -> @location(0) vec4<f32> {
+    let pixel = input.position.xy;
+    let mask = textured_mesh.content_mask;
+    if (pixel.x < mask.x || pixel.y < mask.y || pixel.x >= mask.x + mask.z || pixel.y >= mask.y + mask.w) {
+        return vec4<f32>(0.0);
+    }
+    let color = textureSampleLevel(t_sprite, s_sprite, input.texture_position, 0.0);
+    return vec4<f32>(color.rgb * textured_mesh.shade, color.a) * textured_mesh.opacity;
+}
+
 /* Functions useful for debugging:
 
 // A heat map color for debugging (blue -> cyan -> green -> yellow -> red).
