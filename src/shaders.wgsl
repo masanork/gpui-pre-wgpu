@@ -14,8 +14,9 @@ struct TexturedQuadParams {
     opacity: f32,
     // Bit 0: leave out the back face.
     flags: u32,
+    // Multiplies the colors.
+    shade: f32,
     pad0: u32,
-    pad1: u32,
 }
 
 @group(1) @binding(0) var<uniform> textured_quad: TexturedQuadParams;
@@ -74,7 +75,8 @@ fn fs_textured_quad(input: TexturedQuadVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
     // The pass holds premultiplied colors.
-    return textureSampleLevel(t_sprite, s_sprite, input.texture_position, 0.0) * textured_quad.opacity;
+    let color = textureSampleLevel(t_sprite, s_sprite, input.texture_position, 0.0);
+    return vec4<f32>(color.rgb * textured_quad.shade, color.a) * textured_quad.opacity;
 }
 
 /* Functions useful for debugging:

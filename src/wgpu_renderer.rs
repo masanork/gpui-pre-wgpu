@@ -91,7 +91,7 @@ struct SurfaceParams {
     content_mask: PodBounds,
 }
 
-/// One `TexturedQuad` as the shader's uniform block (128 bytes).
+/// One `TexturedQuad` as the shader's uniform block (144 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct TexturedQuadParams {
@@ -101,7 +101,8 @@ struct TexturedQuadParams {
     transform: [f32; 16],
     opacity: f32,
     flags: u32,
-    pad: [u32; 2],
+    shade: f32,
+    pad: [u32; 1],
 }
 
 #[repr(C)]
@@ -1764,7 +1765,8 @@ impl WgpuRenderer {
                 transform: quad.transform,
                 opacity: quad.opacity,
                 flags: quad.flags,
-                pad: [0; 2],
+                shade: quad.shade,
+                pad: [0; 1],
             };
             let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("textured_quad_params"),
