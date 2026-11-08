@@ -1,3 +1,82 @@
+// --- textured quads (ibis: an offscreen texture drawn through a 4x4 transform) --- //
+
+struct TexturedQuadParams {
+    // The rectangle on the plane z = 0, in device pixels.
+    bounds: Bounds,
+    content_mask: Bounds,
+    // left, top, width, height of the part of the texture drawn, in 0..1.
+    uv: vec4<f32>,
+    // The transform, column-major.
+    column0: vec4<f32>,
+    column1: vec4<f32>,
+    column2: vec4<f32>,
+    column3: vec4<f32>,
+    opacity: f32,
+    // Bit 0: leave out the back face.
+    flags: u32,
+    pad0: u32,
+    pad1: u32,
+}
+
+@group(1) @binding(0) var<uniform> textured_quad: TexturedQuadParams;
+
+struct TexturedQuadVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texture_position: vec2<f32>,
+}
+
+// The homogeneous screen position (x, y, z, w) of a point of the rectangle's plane.
+fn textured_quad_clip(plane_position: vec2<f32>) -> vec4<f32> {
+    let q = textured_quad;
+    return q.column0 * plane_position.x + q.column1 * plane_position.y + q.column3;
+}
+
+@vertex
+fn vs_textured_quad(@builtin(vertex_index) vertex_id: u32) -> TexturedQuadVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let origin = textured_quad.bounds.origin;
+    let extent = textured_quad.bounds.size;
+    let clip = textured_quad_clip(origin + unit_vertex * extent);
+
+    var out = TexturedQuadVarying();
+    // Pixels (x / w, y / w) to normalized device coordinates, kept homogeneous so that the hardware interpolates the
+    // texture with perspective. The depth makes the hardware cut at w = 0.001 (the plane of the eye); no depth test.
+    out.position = vec4<f32>(
+        clip.x * 2.0 / globals.viewport_size.x - clip.w,
+        clip.w - clip.y * 2.0 / globals.viewport_size.y,
+        clip.w - 0.001,
+        clip.w);
+    if ((textured_quad.flags & 1u) != 0u) {
+        // Cull the back face: the winding of the rectangle's corners on the screen.
+        let c0 = textured_quad_clip(origin);
+        let c1 = textured_quad_clip(origin + vec2<f32>(extent.x, 0.0));
+        let c2 = textured_quad_clip(origin + vec2<f32>(0.0, extent.y));
+        if (c0.w > 0.001 && c1.w > 0.001 && c2.w > 0.001) {
+            let p0 = c0.xy / c0.w;
+            let p1 = c1.xy / c1.w;
+            let p2 = c2.xy / c2.w;
+            let area = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+            if (area < 0.0) {
+                out.position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+            }
+        }
+    }
+    out.texture_position = textured_quad.uv.xy + unit_vertex * textured_quad.uv.zw;
+    return out;
+}
+
+@fragment
+fn fs_textured_quad(input: TexturedQuadVarying) -> @location(0) vec4<f32> {
+    let pixel = input.position.xy;
+    let mask = textured_quad.content_mask;
+    if (pixel.x < mask.origin.x || pixel.y < mask.origin.y ||
+        pixel.x >= mask.origin.x + mask.size.x || pixel.y >= mask.origin.y + mask.size.y) {
+        return vec4<f32>(0.0);
+    }
+    // The pass holds premultiplied colors.
+    return textureSampleLevel(t_sprite, s_sprite, input.texture_position, 0.0) * textured_quad.opacity;
+}
+
 /* Functions useful for debugging:
 
 // A heat map color for debugging (blue -> cyan -> green -> yellow -> red).
