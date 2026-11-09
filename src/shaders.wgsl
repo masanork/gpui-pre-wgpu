@@ -1386,6 +1386,20 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     return blend_color(input.color, alpha_corrected);
 }
 
+// Modified by ibis inc.: the same sprite for coverage that is already corrected (glyphs rasterized by the browser's canvas): no contrast
+// enhancement and no gamma correction (they were applied twice, which made the text look bold).
+@fragment
+fn fs_mono_sprite_raw(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
+
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    return blend_color(input.color, sample);
+}
+
 // --- polychrome sprites --- //
 
 struct PolychromeSprite {

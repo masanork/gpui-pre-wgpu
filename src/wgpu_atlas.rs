@@ -9,6 +9,24 @@ use std::{borrow::Cow, ops, sync::Arc};
 
 use crate::WgpuContext;
 
+/// Modified by ibis inc.: glyphs rasterized by the browser's canvas (the web text system's canvas fonts) already carry the browser's own
+/// contrast and gamma, so they must not go through the shader's `apply_contrast_and_gamma_correction` a second time (the text looked bold).
+/// They are kept in textures of their own: a texture whose `AtlasTextureId::index` is at least this base is drawn by the pipeline without the
+/// correction (`is_raw_coverage_texture`); the index inside the list is the index minus the base.
+pub const RAW_COVERAGE_INDEX_BASE: u32 = 1 << 30;
+
+/// Whether the texture holds coverage that is already corrected (see `RAW_COVERAGE_INDEX_BASE`).
+pub fn is_raw_coverage_texture(id: AtlasTextureId) -> bool {
+    id.kind == AtlasTextureKind::Monochrome && id.index >= RAW_COVERAGE_INDEX_BASE
+}
+
+/// The font ids of the web text system's canvas fonts carry the top bit (`CANVAS_FONT_BIT` of `gpui-pre-web`'s `text_system.rs`).
+const CANVAS_FONT_BIT: usize = 1 << (usize::BITS - 1);
+
+fn is_canvas_glyph(key: &AtlasKey) -> bool {
+    matches!(key, AtlasKey::Glyph(params) if params.font_id.0 & CANVAS_FONT_BIT != 0 && key.texture_kind() == AtlasTextureKind::Monochrome)
+}
+
 fn device_size_to_etagere(size: Size<DevicePixels>) -> etagere::Size {
     size2(size.width.0, size.height.0)
 }
@@ -35,6 +53,8 @@ struct WgpuAtlasTextures {
     color_texture_format: wgpu::TextureFormat,
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
+    /// The glyph being inserted is a canvas glyph (set by `WgpuAtlas::get_or_insert_with` while it inserts).
+    insert_raw_coverage: bool,
 }
 
 pub struct WgpuTextureInfo {
@@ -55,6 +75,7 @@ impl WgpuAtlas {
             color_texture_format,
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
+            insert_raw_coverage: false,
         })))
     }
 
@@ -107,7 +128,11 @@ impl PlatformAtlas for WgpuAtlas {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
-        self.0.lock().get_or_insert_with(key, build)
+        let mut lock = self.0.lock();
+        lock.backend.insert_raw_coverage = is_canvas_glyph(&key);
+        let tile = lock.get_or_insert_with(key, build);
+        lock.backend.insert_raw_coverage = false;
+        tile
     }
 
     fn remove(&self, key: &AtlasKey) {
@@ -122,14 +147,18 @@ impl AtlasBackend for WgpuAtlasTextures {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> Result<AtlasTile> {
-        let tile = self.allocate(size, kind).context("failed to allocate")?;
+        let raw = self.insert_raw_coverage && kind == AtlasTextureKind::Monochrome;
+        let tile = self.allocate(size, kind, raw).context("failed to allocate")?;
         self.upload_texture(tile.texture_id, tile.bounds, bytes);
         Ok(tile)
     }
 
     fn remove(&mut self, tile: AtlasTile) {
         let id = tile.texture_id;
-        let Some(texture_slot) = self.storage[id.kind].textures.get_mut(id.index as usize) else {
+        let raw = is_raw_coverage_texture(id);
+        let local = id.index as usize - if raw { RAW_COVERAGE_INDEX_BASE as usize } else { 0 };
+        let list = if raw { &mut self.storage.raw_coverage_textures } else { &mut self.storage[id.kind] };
+        let Some(texture_slot) = list.textures.get_mut(local) else {
             return;
         };
 
@@ -139,9 +168,7 @@ impl AtlasBackend for WgpuAtlasTextures {
             if texture.is_unreferenced() {
                 self.pending_uploads
                     .retain(|upload| upload.id != texture.id);
-                self.storage[id.kind]
-                    .free_list
-                    .push(texture.id.index as usize);
+                list.free_list.push(local);
             } else {
                 *texture_slot = Some(texture);
             }
@@ -154,9 +181,10 @@ impl WgpuAtlasTextures {
         &mut self,
         size: Size<DevicePixels>,
         texture_kind: AtlasTextureKind,
+        raw: bool,
     ) -> Option<AtlasTile> {
         {
-            let textures = &mut self.storage[texture_kind];
+            let textures = if raw { &mut self.storage.raw_coverage_textures } else { &mut self.storage[texture_kind] };
 
             if let Some(tile) = textures
                 .iter_mut()
@@ -167,7 +195,7 @@ impl WgpuAtlasTextures {
             }
         }
 
-        let texture = self.push_texture(size, texture_kind);
+        let texture = self.push_texture(size, texture_kind, raw);
         texture.allocate(size)
     }
 
@@ -175,6 +203,7 @@ impl WgpuAtlasTextures {
         &mut self,
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
+        raw: bool,
     ) -> &mut WgpuAtlasTexture {
         const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(1024),
@@ -209,12 +238,12 @@ impl WgpuAtlasTextures {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let texture_list = &mut self.storage[kind];
+        let texture_list = if raw { &mut self.storage.raw_coverage_textures } else { &mut self.storage[kind] };
         let index = texture_list.free_list.pop();
 
         let atlas_texture = WgpuAtlasTexture {
             id: AtlasTextureId {
-                index: index.unwrap_or(texture_list.textures.len()) as u32,
+                index: index.unwrap_or(texture_list.textures.len()) as u32 + if raw { RAW_COVERAGE_INDEX_BASE } else { 0 },
                 kind,
             },
             allocator: BucketedAtlasAllocator::new(device_size_to_etagere(size)),
@@ -291,6 +320,8 @@ struct WgpuAtlasStorage {
     monochrome_textures: AtlasTextureList<WgpuAtlasTexture>,
     subpixel_textures: AtlasTextureList<WgpuAtlasTexture>,
     polychrome_textures: AtlasTextureList<WgpuAtlasTexture>,
+    /// Monochrome textures of canvas glyphs (see `RAW_COVERAGE_INDEX_BASE`).
+    raw_coverage_textures: AtlasTextureList<WgpuAtlasTexture>,
 }
 
 impl ops::Index<AtlasTextureKind> for WgpuAtlasStorage {
@@ -315,25 +346,25 @@ impl ops::IndexMut<AtlasTextureKind> for WgpuAtlasStorage {
 }
 
 impl WgpuAtlasStorage {
+    fn list_of(&self, id: AtlasTextureId) -> (&AtlasTextureList<WgpuAtlasTexture>, usize) {
+        if is_raw_coverage_texture(id) {
+            (&self.raw_coverage_textures, (id.index - RAW_COVERAGE_INDEX_BASE) as usize)
+        } else {
+            (&self[id.kind], id.index as usize)
+        }
+    }
+
     fn get(&self, id: AtlasTextureId) -> Option<&WgpuAtlasTexture> {
-        self[id.kind]
-            .textures
-            .get(id.index as usize)
-            .and_then(|t| t.as_ref())
+        let (list, index) = self.list_of(id);
+        list.textures.get(index).and_then(|t| t.as_ref())
     }
 }
 
 impl ops::Index<AtlasTextureId> for WgpuAtlasStorage {
     type Output = WgpuAtlasTexture;
     fn index(&self, id: AtlasTextureId) -> &Self::Output {
-        let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &self.monochrome_textures,
-            AtlasTextureKind::Subpixel => &self.subpixel_textures,
-            AtlasTextureKind::Polychrome => &self.polychrome_textures,
-        };
-        textures[id.index as usize]
-            .as_ref()
-            .expect("texture must exist")
+        let (list, index) = self.list_of(id);
+        list.textures[index].as_ref().expect("texture must exist")
     }
 }
 
@@ -431,6 +462,29 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
             Ok((Arc::new(device), Arc::new(queue)))
         })
+    }
+
+    #[test]
+    fn only_monochrome_canvas_glyphs_are_raw_coverage() {
+        use gpui::{FontId, GlyphId, RenderGlyphParams, px};
+        let glyph = |font: usize, emoji: bool| {
+            AtlasKey::Glyph(RenderGlyphParams {
+                font_id: FontId(font),
+                glyph_id: GlyphId(1),
+                font_size: px(14.),
+                subpixel_variant: Point::default(),
+                scale_factor: 1.0,
+                is_emoji: emoji,
+                subpixel_rendering: false,
+                dilation: 0,
+            })
+        };
+        assert!(is_canvas_glyph(&glyph(CANVAS_FONT_BIT | 3, false)));
+        assert!(!is_canvas_glyph(&glyph(3, false)), "the native text system's glyphs keep the correction");
+        assert!(!is_canvas_glyph(&glyph(CANVAS_FONT_BIT | 3, true)), "colour glyphs are not monochrome");
+        let id = |index, kind| AtlasTextureId { index, kind };
+        assert!(is_raw_coverage_texture(id(RAW_COVERAGE_INDEX_BASE + 2, AtlasTextureKind::Monochrome)));
+        assert!(!is_raw_coverage_texture(id(2, AtlasTextureKind::Monochrome)));
     }
 
     #[test]

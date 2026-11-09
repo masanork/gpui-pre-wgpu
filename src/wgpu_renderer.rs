@@ -171,6 +171,8 @@ struct WgpuPipelines {
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
+    /// `mono_sprites` for coverage that is already corrected (`wgpu_atlas::is_raw_coverage_texture`).
+    mono_sprites_raw: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
@@ -1147,6 +1149,19 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let mono_sprites_raw = create_pipeline(
+            "mono_sprites_raw",
+            "vs_mono_sprite",
+            "fs_mono_sprite_raw",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
         let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
             let subpixel_blend = wgpu::BlendState {
                 color: wgpu::BlendComponent {
@@ -1285,6 +1300,7 @@ impl WgpuRenderer {
             paths,
             underlines,
             mono_sprites,
+            mono_sprites_raw,
             subpixel_sprites,
             poly_sprites,
             surfaces,
@@ -1796,7 +1812,11 @@ impl WgpuRenderer {
                     PrimitiveBatch::MonochromeSprites { texture_id, range } => self.draw_sprites(
                         &instance_bindings.monochrome_sprites,
                         texture_id,
-                        &self.resources().pipelines.mono_sprites,
+                        if crate::wgpu_atlas::is_raw_coverage_texture(texture_id) {
+                            &self.resources().pipelines.mono_sprites_raw
+                        } else {
+                            &self.resources().pipelines.mono_sprites
+                        },
                         instance_range(range),
                         &mut pass,
                     ),
