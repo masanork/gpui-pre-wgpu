@@ -451,6 +451,8 @@ impl CosmicTextSystemState {
 
             if font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
+                && !postscript_name.strip_prefix("IBS").and_then(|s| s.strip_suffix("-Regular"))
+                    .is_some_and(|digits| digits.len() == 6 && digits.bytes().all(|c| c.is_ascii_digit()))
             {
                 self.font_system.db_mut().remove_face(font.id());
                 continue;
