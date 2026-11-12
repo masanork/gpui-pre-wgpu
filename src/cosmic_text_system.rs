@@ -67,6 +67,49 @@ struct CosmicTextSystemState {
     font_files: HashMap<usize, Arc<Vec<u8>>>,
 }
 
+/// Serif (mincho) or sans (gothic) design of a face. A request for one class must never fall back to a face of the other
+/// (a gothic request drawn in IPAmj Mincho, K0017).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceClass {
+    Serif,
+    Sans,
+}
+
+/// Class from the OS/2 table of the face `index` of an sfnt/ttc file. `sFamilyClass` high byte: 1-5 and 7 are serif
+/// classes, 8 is sans-serif (the other classes - scripts, ornamentals, symbolic - say nothing). When it says nothing, PANOSE
+/// (family type 2 = Latin text): serif style 2.. 10 serif ("no fit" and "any" say nothing), 11-14 and 16 sans.
+pub fn os2_face_class(data: &[u8], index: u32) -> Option<FaceClass> {
+    let be16 = |at: usize| data.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize);
+    let be32 = |at: usize| {
+        data.get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let base = if data.get(0..4)? == b"ttcf" {
+        be32(12 + 4 * index as usize)?
+    } else {
+        0
+    };
+    let tables = be16(base + 4)?;
+    let os2 = (0..tables).find_map(|i| {
+        let record = base + 12 + 16 * i;
+        (data.get(record..record + 4)? == b"OS/2").then(|| be32(record + 8))?
+    })?;
+    let class = *data.get(os2 + 30)?;
+    match class {
+        1..=5 | 7 => return Some(FaceClass::Serif),
+        8 => return Some(FaceClass::Sans),
+        _ => {}
+    }
+    if *data.get(os2 + 32)? != 2 {
+        return None;
+    }
+    match *data.get(os2 + 33)? {
+        3..=10 => Some(FaceClass::Serif),
+        11..=14 | 16 => Some(FaceClass::Sans),
+        _ => None,
+    }
+}
+
 struct LoadedFont {
     font: Arc<CosmicTextFont>,
     features: CosmicFontFeatures,
@@ -119,6 +162,20 @@ impl CosmicTextSystem {
             cosmic_text::Style::Oblique => gpui::FontStyle::Oblique,
         };
         Ok((gpui::FontWeight(face.weight.0 as f32), style))
+    }
+
+    /// Whether `face` (a font ID a laid-out glyph run reports) belongs to the families `requested` asked for: its own family, or one
+    /// of the fallbacks its descriptor lists. cosmic-text's last-resort fallback can pick any loaded face; this tells an outer text
+    /// system such a face from one the requested font named (modified by ibis inc., K0017).
+    pub fn face_in_requested_families(&self, requested: FontId, face: FontId) -> bool {
+        self.0.read().face_in_requested_families(requested, face)
+    }
+
+    /// The class of a loaded face, from its OS/2 table (`sFamilyClass`, else PANOSE), or `None` when the face does not say
+    /// (modified by ibis inc., K0017).
+    pub fn face_class(&self, font_id: FontId) -> Option<FaceClass> {
+        let (data, index) = gpui::PlatformTextSystem::font_data(self, font_id)?;
+        os2_face_class(&data, index)
     }
 
     /// Builds reports for unresolved source indices after an outer text system
@@ -334,6 +391,33 @@ impl CosmicTextSystemState {
             weight: face.weight,
             features: loaded_font.features.clone(),
             fallback_chain: Arc::clone(&loaded_font.user_fallback_chain),
+        })
+    }
+
+    fn family_names(&self, font_id: FontId) -> Vec<String> {
+        self.loaded_fonts
+            .get(font_id.0)
+            .and_then(|loaded| self.font_system.db().face(loaded.font.id()))
+            .map(|face| face.families.iter().map(|(name, _)| name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn face_in_requested_families(&self, requested: FontId, face: FontId) -> bool {
+        if requested == face {
+            return true;
+        }
+        let face_names = self.family_names(face);
+        let is_requested = |name: &str| face_names.iter().any(|n| n.eq_ignore_ascii_case(name));
+        if self.family_names(requested).iter().any(|n| is_requested(n)) {
+            return true;
+        }
+        let Some(loaded) = self.loaded_fonts.get(requested.0) else {
+            return false;
+        };
+        loaded.user_fallback_chain.iter().any(|(id, name)| {
+            *id == face
+                || is_requested(name)
+                || self.family_names(*id).iter().any(|n| is_requested(n))
         })
     }
 
@@ -1375,6 +1459,55 @@ mod tests {
             observed[0].font_class(),
             gpui::FallbackFontClass::Proportional
         );
+        Ok(())
+    }
+
+    #[test]
+    fn requested_families_tell_a_named_face_from_an_implicit_one() -> Result<()> {
+        let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
+        text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX), Cow::Borrowed(LILEX)])?;
+        let plain = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        let mono = text_system.font_id(&gpui::font("Lilex"))?;
+        // A face loaded for another family is not one `plain` asked for ...
+        assert!(text_system.face_in_requested_families(plain, plain));
+        assert!(!text_system.face_in_requested_families(plain, mono));
+        // ... unless the descriptor lists that family as a fallback.
+        let mut with_fallback = gpui::font("IBM Plex Sans");
+        with_fallback.fallbacks = Some(gpui::FontFallbacks::from_fonts(vec!["Lilex".to_string()]));
+        let chained = text_system.font_id(&with_fallback)?;
+        assert!(text_system.face_in_requested_families(chained, mono));
+        Ok(())
+    }
+
+    /// An sfnt with one OS/2 table holding `sFamilyClass` high byte `class` and PANOSE family type / serif style.
+    fn sfnt_with_os2(class: u8, panose_family: u8, panose_serif: u8) -> Vec<u8> {
+        let mut data = vec![0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        data.extend_from_slice(b"OS/2");
+        data.extend_from_slice(&[0; 4]);
+        data.extend_from_slice(&28u32.to_be_bytes());
+        data.extend_from_slice(&96u32.to_be_bytes());
+        data.resize(28 + 96, 0);
+        data[28 + 30] = class;
+        data[28 + 32] = panose_family;
+        data[28 + 33] = panose_serif;
+        data
+    }
+
+    #[test]
+    fn face_class_reads_os2_family_class_then_panose() {
+        assert_eq!(os2_face_class(&sfnt_with_os2(2, 0, 0), 0), Some(FaceClass::Serif));
+        assert_eq!(os2_face_class(&sfnt_with_os2(8, 2, 3), 0), Some(FaceClass::Sans));
+        assert_eq!(os2_face_class(&sfnt_with_os2(0, 2, 9), 0), Some(FaceClass::Serif));
+        assert_eq!(os2_face_class(&sfnt_with_os2(0, 2, 11), 0), Some(FaceClass::Sans));
+        assert_eq!(os2_face_class(&sfnt_with_os2(0, 3, 9), 0), None);
+        assert_eq!(os2_face_class(&[0; 8], 0), None);
+    }
+
+    #[test]
+    fn bundled_faces_are_sans() -> Result<()> {
+        let text_system = text_system()?;
+        let plex = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        assert_eq!(text_system.face_class(plex), Some(FaceClass::Sans));
         Ok(())
     }
 
