@@ -1,15 +1,17 @@
+// Modified by ibis inc. for ibisOffice (2026-11-08): offscreen passes and textured quads (a texture drawn through a 4x4 transform), on the storage-buffer and the WebGL2 paths alike.
 // Modified by ibis inc. for ibisOffice (2026-10-14): a renderer can draw into a texture instead of a window's surface; added `WgpuHeadlessRenderer` (drawing scenes into images without a window).
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    ScaledPixels, Scene, Size, TexturedMesh, TexturedQuad, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
@@ -89,6 +91,42 @@ struct SurfaceParams {
     content_mask: PodBounds,
 }
 
+/// One `TexturedQuad` as the shader's uniform block (144 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TexturedQuadParams {
+    bounds: PodBounds,
+    content_mask: PodBounds,
+    uv: [f32; 4],
+    transform: [f32; 16],
+    opacity: f32,
+    flags: u32,
+    shade: f32,
+    pad: [u32; 1],
+}
+
+/// A vertex of a mesh as the vertex buffer holds it (32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MeshVertexGpu {
+    position: [f32; 3],
+    pad0: f32,
+    uv: [f32; 2],
+    pad1: [f32; 2],
+}
+
+/// One `TexturedMesh` as the shader's uniform block (96 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TexturedMeshParams {
+    transform: [f32; 16],
+    content_mask: [f32; 4],
+    opacity: f32,
+    shade: f32,
+    flags: u32,
+    pad: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GammaParams {
@@ -133,10 +171,16 @@ struct WgpuPipelines {
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
+    /// `mono_sprites` for coverage that is already corrected (`wgpu_atlas::is_raw_coverage_texture`).
+    mono_sprites_raw: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    textured_quads: wgpu::RenderPipeline,
+    /// For triangle meshes: drawing both faces, and only the front.
+    textured_meshes: wgpu::RenderPipeline,
+    textured_meshes_culled: wgpu::RenderPipeline,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -164,6 +208,8 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    textured_quads: wgpu::BindGroupLayout,
+    textured_meshes: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -200,6 +246,20 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// The textures of the offscreen passes by `OffscreenId`: window-sized, kept from frame to frame, with the size
+    /// of the pass drawn in their top left.
+    offscreen_passes: HashMap<u32, OffscreenTexture>,
+}
+
+struct OffscreenTexture {
+    /// Kept so that the view's texture lives as long as the entry.
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// The size the texture was made at (the surface's).
+    size: (u32, u32),
+    /// The size of the pass drawn in it, in its top left corner.
+    content: (u32, u32),
 }
 
 impl WgpuResources {
@@ -239,6 +299,7 @@ impl WgpuResources {
     }
 
     fn invalidate_intermediate_textures(&mut self) {
+        self.offscreen_passes.clear();
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
@@ -639,6 +700,7 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            offscreen_passes: HashMap::new(),
         };
 
         Ok(Self {
@@ -793,11 +855,43 @@ impl WgpuRenderer {
             ],
         });
 
+        let textured_quads = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("textured_quads_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(
+                        std::mem::size_of::<TexturedQuadParams>() as u64
+                    ),
+                },
+                count: None,
+            }],
+        });
+
+        let textured_meshes = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("textured_meshes_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<TexturedMeshParams>() as u64),
+                },
+                count: None,
+            }],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             texture,
             surfaces,
+            textured_quads,
+            textured_meshes,
         }
     }
 
@@ -1055,6 +1149,19 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let mono_sprites_raw = create_pipeline(
+            "mono_sprites_raw",
+            "vs_mono_sprite",
+            "fs_mono_sprite_raw",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
         let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
             let subpixel_blend = wgpu::BlendState {
                 color: wgpu::BlendComponent {
@@ -1115,6 +1222,77 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        // The textures of the offscreen passes hold premultiplied colors.
+        let textured_quads = create_pipeline(
+            "textured_quads",
+            "vs_textured_quad",
+            "fs_textured_quad",
+            &layouts.globals,
+            &layouts.textured_quads,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
+        // Triangle meshes: the vertices come from a vertex buffer (WebGL2 has no storage buffers), the triangles from an index buffer.
+        let mesh_pipeline = |name: &str, cull: Option<wgpu::Face>| {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{name}_layout")),
+                bind_group_layouts: &[Some(&layouts.globals), Some(&layouts.textured_meshes), Some(&layouts.texture)],
+                immediate_size: 0,
+            });
+            let vertex_attributes = [
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 16, shader_location: 1 },
+            ];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(name),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_textured_mesh"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 32,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &vertex_attributes,
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: Some("fs_textured_mesh"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    // A front triangle is clockwise on the screen.
+                    front_face: wgpu::FrontFace::Cw,
+                    cull_mode: cull,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let textured_meshes = mesh_pipeline("textured_meshes", None);
+        let textured_meshes_culled = mesh_pipeline("textured_meshes_culled", Some(wgpu::Face::Back));
+
         WgpuPipelines {
             quads,
             shadows,
@@ -1122,9 +1300,13 @@ impl WgpuRenderer {
             paths,
             underlines,
             mono_sprites,
+            mono_sprites_raw,
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            textured_quads,
+            textured_meshes,
+            textured_meshes_culled,
         }
     }
 
@@ -1471,7 +1653,67 @@ impl WgpuRenderer {
         true
     }
 
+    /// The texture of the offscreen pass `id` for a pass of `content` size: window-sized (so the viewport and the
+    /// path intermediate textures fit it as they are), made again when the window's size changed.
+    fn offscreen_pass_view(&mut self, id: u32, content: (u32, u32)) -> wgpu::TextureView {
+        let size = (self.surface_config.width, self.surface_config.height);
+        let format = self.surface_config.format;
+        let resources = self.resources_mut();
+        if let Some(existing) = resources.offscreen_passes.get_mut(&id) {
+            if existing.size == size {
+                existing.content = content;
+                return existing.view.clone();
+            }
+        }
+        let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen_pass"),
+            size: wgpu::Extent3d {
+                width: size.0.max(1),
+                height: size.1.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        resources.offscreen_passes.insert(
+            id,
+            OffscreenTexture {
+                texture,
+                view: view.clone(),
+                size,
+                content,
+            },
+        );
+        view
+    }
+
+    /// Draw the offscreen passes of `scene` (each to its texture, before the scene itself), then the scene.
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+        let mut used = Vec::new();
+        for pass in &scene.offscreens {
+            if pass.size.width.0 <= 0 || pass.size.height.0 <= 0 {
+                continue;
+            }
+            let content = (
+                (pass.size.width.0 as u32).min(self.surface_config.width),
+                (pass.size.height.0 as u32).min(self.surface_config.height),
+            );
+            let view = self.offscreen_pass_view(pass.id.0, content);
+            used.push(pass.id.0);
+            self.record_scene(&pass.scene, &view)?;
+        }
+        self.resources_mut()
+            .offscreen_passes
+            .retain(|id, _| used.contains(id));
+        self.record_scene(scene, frame_view)
+    }
+
+    fn record_scene(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1570,7 +1812,11 @@ impl WgpuRenderer {
                     PrimitiveBatch::MonochromeSprites { texture_id, range } => self.draw_sprites(
                         &instance_bindings.monochrome_sprites,
                         texture_id,
-                        &self.resources().pipelines.mono_sprites,
+                        if crate::wgpu_atlas::is_raw_coverage_texture(texture_id) {
+                            &self.resources().pipelines.mono_sprites_raw
+                        } else {
+                            &self.resources().pipelines.mono_sprites
+                        },
                         instance_range(range),
                         &mut pass,
                     ),
@@ -1598,6 +1844,12 @@ impl WgpuRenderer {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::TexturedQuads(range) => {
+                        self.draw_textured_quads(&scene.textured_quads[range], &mut pass)
+                    }
+                    PrimitiveBatch::TexturedMeshes(range) => {
+                        self.draw_textured_meshes(&scene.textured_meshes[range], &mut pass)
+                    }
                 }
             }
         }
@@ -1606,6 +1858,125 @@ impl WgpuRenderer {
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+
+    fn draw_textured_meshes(&self, meshes: &[TexturedMesh], pass: &mut wgpu::RenderPass<'_>) {
+        let resources = self.resources();
+        for mesh in meshes {
+            // A texture that was not painted in this frame draws nothing.
+            let Some(offscreen) = resources.offscreen_passes.get(&mesh.texture.0) else {
+                continue;
+            };
+            // The pass is drawn in the top left of its (window-sized) texture: the vertices' texture points, in that.
+            let (kx, ky) = (
+                offscreen.content.0 as f32 / offscreen.size.0.max(1) as f32,
+                offscreen.content.1 as f32 / offscreen.size.1.max(1) as f32,
+            );
+            let vertices: Vec<MeshVertexGpu> = mesh
+                .vertices
+                .iter()
+                .map(|v| MeshVertexGpu {
+                    position: v.position,
+                    pad0: 0.0,
+                    uv: [v.uv[0] * kx, v.uv[1] * ky],
+                    pad1: [0.0; 2],
+                })
+                .collect();
+            let mask = mesh.content_mask.bounds;
+            let params = TexturedMeshParams {
+                transform: mesh.transform,
+                content_mask: [mask.origin.x.0, mask.origin.y.0, mask.size.width.0, mask.size.height.0],
+                opacity: mesh.opacity,
+                shade: mesh.shade,
+                flags: mesh.flags,
+                pad: 0,
+            };
+            let make_buffer = |label: &str, usage: wgpu::BufferUsages, bytes: &[u8]| {
+                let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: bytes.len() as u64,
+                    usage: usage | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                resources.queue.write_buffer(&buffer, 0, bytes);
+                buffer
+            };
+            let vertex_buffer = make_buffer("mesh_vertices", wgpu::BufferUsages::VERTEX, bytemuck::cast_slice(&vertices));
+            let index_buffer = make_buffer("mesh_indices", wgpu::BufferUsages::INDEX, bytemuck::cast_slice(mesh.indices.as_slice()));
+            let params_buffer = make_buffer("mesh_params", wgpu::BufferUsages::UNIFORM, bytemuck::bytes_of(&params));
+            let params_group = resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("textured_mesh_bind_group"),
+                layout: &resources.bind_group_layouts.textured_meshes,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() }],
+            });
+            let texture = self.create_texture_bind_group("offscreen_texture_bind_group", &offscreen.view);
+            pass.set_pipeline(if mesh.flags & TexturedQuad::CULL_BACK != 0 {
+                &resources.pipelines.textured_meshes_culled
+            } else {
+                &resources.pipelines.textured_meshes
+            });
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &params_group, &[]);
+            pass.set_bind_group(2, &texture, &[]);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
+        }
+    }
+
+    fn draw_textured_quads(&self, quads: &[TexturedQuad], pass: &mut wgpu::RenderPass<'_>) {
+        let resources = self.resources();
+        for quad in quads {
+            // A texture that was not painted in this frame draws nothing.
+            let Some(offscreen) = resources.offscreen_passes.get(&quad.texture.0) else {
+                continue;
+            };
+            // The pass is drawn in the top left of its (window-sized) texture: the quad's part of it, in that.
+            let (kx, ky) = (
+                offscreen.content.0 as f32 / offscreen.size.0.max(1) as f32,
+                offscreen.content.1 as f32 / offscreen.size.1.max(1) as f32,
+            );
+            let params = TexturedQuadParams {
+                bounds: quad.bounds.into(),
+                content_mask: quad.content_mask.bounds.into(),
+                uv: [
+                    quad.uv[0] * kx,
+                    quad.uv[1] * ky,
+                    quad.uv[2] * kx,
+                    quad.uv[3] * ky,
+                ],
+                transform: quad.transform,
+                opacity: quad.opacity,
+                flags: quad.flags,
+                shade: quad.shade,
+                pad: [0; 1],
+            };
+            let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("textured_quad_params"),
+                size: std::mem::size_of::<TexturedQuadParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            resources
+                .queue
+                .write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
+            let params_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("textured_quad_bind_group"),
+                    layout: &resources.bind_group_layouts.textured_quads,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                });
+            let texture = self.create_texture_bind_group("offscreen_texture_bind_group", &offscreen.view);
+            pass.set_pipeline(&resources.pipelines.textured_quads);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &params_group, &[]);
+            pass.set_bind_group(2, &texture, &[]);
+            pass.draw(0..4, 0..1);
+        }
     }
 
     fn write_instances(
