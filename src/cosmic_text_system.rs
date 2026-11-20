@@ -1,3 +1,5 @@
+// Modified by ibis inc. for ibisOffice (2026-11-18): a system face with no 'm' glyph is kept when it is a colour font (an emoji font such as Noto Color Emoji).
+// Modified by ibis inc. for ibisOffice (2026-11-17): a face added by `add_fonts` is loaded without an 'm' glyph (the system's fonts are checked as before).
 // Modified by ibis inc. for ibisOffice (2026-10-14): implemented `PlatformTextSystem::font_data`.
 // Modified by ibis inc. for ibisOffice (2026-10-18): the system's locale is given to cosmic-text as the language alone
 // (`ja-JP` → `ja`), so that kanji not in a font are drawn in the Japanese font, not the Simplified Chinese one.
@@ -65,6 +67,9 @@ struct CosmicTextSystemState {
     /// Font files copied for `font_data`, by the address of the data the
     /// font database holds (one copy for all the faces of a collection).
     font_files: HashMap<usize, Arc<Vec<u8>>>,
+    /// The faces `add_fonts` gave (the application's own fonts, as against the system's): they are loaded without an 'm' glyph too
+    /// (modified by ibis inc.; see `load_family`).
+    added_faces: collections::HashSet<cosmic_text::fontdb::ID>,
 }
 
 /// Serif (mincho) or sans (gothic) design of a face. A request for one class must never fall back to a face of the other
@@ -212,6 +217,7 @@ impl CosmicTextSystem {
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
             font_files: HashMap::default(),
+            added_faces: Default::default(),
         }))
     }
 
@@ -232,6 +238,7 @@ impl CosmicTextSystem {
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
             font_files: HashMap::default(),
+            added_faces: Default::default(),
         }))
     }
 }
@@ -442,7 +449,8 @@ impl CosmicTextSystemState {
         self.font_ids_by_family_cache.clear();
         let db = self.font_system.db_mut();
         for bytes in fonts {
-            db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
+            let ids = db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
+            self.added_faces.extend(ids);
         }
         Ok(())
     }
@@ -533,10 +541,20 @@ impl CosmicTextSystemState {
                 "Add Character_GJMincho",
             ];
 
+            // Modified by ibis inc.: a face that was added by `add_fonts` (the application's own fonts, the setup's downloads and the
+            // subsets of them) is kept without an 'm' too. A font of the Digital Agency (Add Character_GJMincho) and the blocks a font is
+            // cut into (the characters of a range of Unicode) have no Latin letters, and with this check the family was "not found"
+            // (#157, #158). Text laid out with them still falls to the next font of the chain for the characters they lack. The system's
+            // fonts are checked as before.
+            // Modified by ibis inc. (2026-11-18, GitHub issue #255): a colour font (an emoji font: Noto Color Emoji has CBDT, Segoe UI Emoji COLR, Apple Color Emoji
+            // sbix) has no 'm' either, and the check threw it out of the database, so no text of the process drew an emoji any more (Linux, 0.8.6). The check is for
+            // symbol and icon fonts that must not stand in for a text font; a font with colour glyphs is kept.
             if font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
                 && !postscript_name.strip_prefix("IBS").and_then(|s| s.strip_suffix("-Regular"))
                     .is_some_and(|digits| digits.len() == 6 && digits.bytes().all(|c| c.is_ascii_digit()))
+                && !self.added_faces.contains(&database_id)
+                && !is_colour_font(&font.as_swash())
             {
                 self.font_system.db_mut().remove_face(font.id());
                 continue;
@@ -926,6 +944,8 @@ impl CosmicTextSystemState {
 
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
+                // GPOS placement (`palt`, kerning, mark positioning) is in `x_offset`/`y_offset`, in em; cosmic-text's own
+                // `LayoutGlyph::physical` adds it, so a position taken from `x`/`y` alone left it out (modified by ibis inc., #230).
                 position: point(
                     (glyph.x + glyph.font_size * glyph.x_offset).into(),
                     (glyph.y - glyph.font_size * glyph.y_offset).into(),
@@ -1310,6 +1330,11 @@ fn face_info_into_properties(
             cosmic_text::Stretch::UltraExpanded => font_kit::properties::Stretch::ULTRA_EXPANDED,
         },
     }
+}
+
+/// Whether the face has colour glyphs: `CBDT` (Noto Color Emoji), `COLR` (Segoe UI Emoji), `sbix` (Apple Color Emoji) or `SVG ` (an OpenType-SVG font).
+fn is_colour_font(font: &swash::FontRef<'_>) -> bool {
+    [b"CBDT", b"COLR", b"sbix", b"SVG "].iter().any(|tag| font.table(swash::tag_from_bytes(tag)).is_some())
 }
 
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
@@ -1937,6 +1962,34 @@ fn han_locale(locale: &str) -> Option<String> {
         _ => return None,
     };
     (locale != wanted).then(|| wanted.to_string())
+}
+
+#[cfg(test)]
+mod no_m_tests {
+    use super::*;
+
+    const COLOUR: &[u8] = include_bytes!("../tests/fonts/colour_no_m.ttf");
+    const SYMBOL: &[u8] = include_bytes!("../tests/fonts/symbol_no_m.ttf");
+
+    /// A system font is one the database has and `add_fonts` did not give; the test puts it into the database directly.
+    fn with_system_font(bytes: &'static [u8], family: &str) -> usize {
+        let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
+        text_system.0.write().font_system.db_mut().load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
+        let loaded = text_system.0.write().load_family(family, &FontFeatures::default(), None).unwrap();
+        loaded.len()
+    }
+
+    #[test]
+    fn a_system_colour_font_without_an_m_is_kept() {
+        // Noto Color Emoji and the like: Linux 0.8.6 lost every emoji when the 'm' check removed the face (GitHub issue #255).
+        assert_eq!(with_system_font(COLOUR, "Ibis Colour Test"), 1);
+    }
+
+    #[test]
+    fn a_system_symbol_font_without_an_m_is_still_dropped() {
+        // The check's purpose: an icon or symbol font does not stand in for a text font.
+        assert_eq!(with_system_font(SYMBOL, "Ibis Symbol Test"), 0);
+    }
 }
 
 #[cfg(test)]
