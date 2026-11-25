@@ -55,10 +55,12 @@ struct WgpuAtlasTextures {
     pending_uploads: Vec<PendingUpload>,
     /// The glyph being inserted is a canvas glyph (set by `WgpuAtlas::get_or_insert_with` while it inserts).
     insert_raw_coverage: bool,
+    next_generation: u64,
 }
 
 pub struct WgpuTextureInfo {
     pub view: wgpu::TextureView,
+    pub generation: u64,
 }
 
 impl WgpuAtlas {
@@ -76,6 +78,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             insert_raw_coverage: false,
+            next_generation: 1,
         })))
     }
 
@@ -97,6 +100,7 @@ impl WgpuAtlas {
         let texture = &lock.backend.storage[id];
         WgpuTextureInfo {
             view: texture.view.clone(),
+            generation: texture.generation,
         }
     }
 
@@ -238,6 +242,8 @@ impl WgpuAtlasTextures {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
         let texture_list = if raw { &mut self.storage.raw_coverage_textures } else { &mut self.storage[kind] };
         let index = texture_list.free_list.pop();
 
@@ -251,6 +257,7 @@ impl WgpuAtlasTextures {
             texture,
             view,
             live_atlas_keys: 0,
+            generation,
         };
 
         if let Some(ix) = index {
@@ -375,6 +382,7 @@ struct WgpuAtlasTexture {
     view: wgpu::TextureView,
     format: wgpu::TextureFormat,
     live_atlas_keys: u32,
+    generation: u64,
 }
 
 impl WgpuAtlasTexture {
