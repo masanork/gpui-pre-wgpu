@@ -555,6 +555,9 @@ impl CosmicTextSystemState {
             let allowed_bad_font_names = [
                 "SegoeFluentIcons", // NOTE: Segoe fluent icons postscript name is inconsistent
                 "Segoe Fluent Icons",
+                // Digital Agency's supplementary administrative font contains
+                // only additional characters and intentionally lacks Latin m.
+                "Add Character_GJMincho",
             ];
 
             // Modified by ibis inc.: a face that was added by `add_fonts` (the application's own fonts, the setup's downloads and the
@@ -567,6 +570,8 @@ impl CosmicTextSystemState {
             // symbol and icon fonts that must not stand in for a text font; a font with colour glyphs is kept.
             if font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
+                && !postscript_name.strip_prefix("IBS").and_then(|s| s.strip_suffix("-Regular"))
+                    .is_some_and(|digits| digits.len() == 6 && digits.bytes().all(|c| c.is_ascii_digit()))
                 && !self.added_faces.contains(&database_id)
                 && !is_colour_font(&font.as_swash())
             {
