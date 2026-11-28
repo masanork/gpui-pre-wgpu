@@ -2082,12 +2082,22 @@ impl WgpuRenderer {
     }
 
     fn draw_textured_quads(&self, quads: &[TexturedQuad], pass: &mut wgpu::RenderPass<'_>) {
+        if quads.is_empty() {
+            return;
+        }
         let resources = self.resources();
+        let mut texture_bind_groups: HashMap<u32, wgpu::BindGroup> = HashMap::new();
+        let mut last_texture: Option<u32> = None;
+        pass.set_pipeline(&resources.pipelines.textured_quads);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         for quad in quads {
             // A texture that was not painted in this frame draws nothing.
             let Some(offscreen) = resources.offscreen_passes.get(&quad.texture.0) else {
                 continue;
             };
+            let texture = texture_bind_groups
+                .entry(quad.texture.0)
+                .or_insert_with(|| self.create_texture_bind_group("offscreen_texture_bind_group", &offscreen.view));
             // The pass is drawn in the top left of its (window-sized) texture: the quad's part of it, in that.
             let (kx, ky) = (
                 offscreen.content.0 as f32 / offscreen.size.0.max(1) as f32,
@@ -2127,11 +2137,11 @@ impl WgpuRenderer {
                         resource: buffer.as_entire_binding(),
                     }],
                 });
-            let texture = self.create_texture_bind_group("offscreen_texture_bind_group", &offscreen.view);
-            pass.set_pipeline(&resources.pipelines.textured_quads);
-            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
             pass.set_bind_group(1, &params_group, &[]);
-            pass.set_bind_group(2, &texture, &[]);
+            if last_texture != Some(quad.texture.0) {
+                pass.set_bind_group(2, &*texture, &[]);
+                last_texture = Some(quad.texture.0);
+            }
             pass.draw(0..4, 0..1);
         }
     }
