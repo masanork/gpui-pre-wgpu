@@ -252,6 +252,8 @@ struct WgpuResources {
     offscreen_passes: HashMap<u32, OffscreenTexture>,
     /// Cached bind groups for atlas textures, keyed by `(AtlasTextureId, generation)`.
     atlas_bind_groups: std::cell::RefCell<HashMap<AtlasTextureId, (u64, wgpu::BindGroup)>>,
+    /// Pooled `(buffer, bind_group)` pairs for `draw_textured_quads` so quads reuse uniform buffers across frames.
+    textured_quad_uniform_pool: std::cell::RefCell<Vec<(wgpu::Buffer, wgpu::BindGroup)>>,
 }
 
 struct OffscreenTexture {
@@ -704,6 +706,7 @@ impl WgpuRenderer {
             path_msaa_view: None,
             offscreen_passes: HashMap::new(),
             atlas_bind_groups: std::cell::RefCell::new(HashMap::new()),
+            textured_quad_uniform_pool: std::cell::RefCell::new(Vec::new()),
         };
 
         Ok(Self {
@@ -2088,6 +2091,8 @@ impl WgpuRenderer {
         let resources = self.resources();
         let mut texture_bind_groups: HashMap<u32, wgpu::BindGroup> = HashMap::new();
         let mut last_texture: Option<u32> = None;
+        let mut quad_pool = resources.textured_quad_uniform_pool.borrow_mut();
+        let mut pool_index = 0usize;
         pass.set_pipeline(&resources.pipelines.textured_quads);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         for quad in quads {
@@ -2118,26 +2123,31 @@ impl WgpuRenderer {
                 shade: quad.shade,
                 pad: [0; 1],
             };
-            let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("textured_quad_params"),
-                size: std::mem::size_of::<TexturedQuadParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            if pool_index >= quad_pool.len() {
+                let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("textured_quad_params"),
+                    size: std::mem::size_of::<TexturedQuadParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let params_group = resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("textured_quad_bind_group"),
+                        layout: &resources.bind_group_layouts.textured_quads,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buffer.as_entire_binding(),
+                        }],
+                    });
+                quad_pool.push((buffer, params_group));
+            }
+            let (buffer, params_group) = &quad_pool[pool_index];
+            pool_index += 1;
             resources
                 .queue
-                .write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
-            let params_group = resources
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("textured_quad_bind_group"),
-                    layout: &resources.bind_group_layouts.textured_quads,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buffer.as_entire_binding(),
-                    }],
-                });
-            pass.set_bind_group(1, &params_group, &[]);
+                .write_buffer(buffer, 0, bytemuck::bytes_of(&params));
+            pass.set_bind_group(1, params_group, &[]);
             if last_texture != Some(quad.texture.0) {
                 pass.set_bind_group(2, &*texture, &[]);
                 last_texture = Some(quad.texture.0);
