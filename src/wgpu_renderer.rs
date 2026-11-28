@@ -1247,12 +1247,14 @@ impl WgpuRenderer {
         let mesh_pipeline = |name: &str, cull: Option<wgpu::Face>| {
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{name}_layout")),
-                bind_group_layouts: &[Some(&layouts.globals), Some(&layouts.textured_meshes), Some(&layouts.texture)],
+                bind_group_layouts: &[Some(&layouts.globals), Some(&layouts.texture)],
                 immediate_size: 0,
             });
             let vertex_attributes = [
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 },
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 16, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 24, shader_location: 2 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 3 },
             ];
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(name),
@@ -1261,7 +1263,7 @@ impl WgpuRenderer {
                     module: &shader_module,
                     entry_point: Some("vs_textured_mesh"),
                     buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: 32,
+                        array_stride: 48,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &vertex_attributes,
                     }],
@@ -1807,7 +1809,7 @@ impl WgpuRenderer {
         }
         self.resources_mut()
             .offscreen_passes
-            .retain(|id, _| used.contains(id));
+            .retain(|id, _| used.contains(id) || scene.retained_offscreens.iter().any(|r| r.0 == *id));
         self.record_scene(scene, frame_view)
     }
 
@@ -1959,66 +1961,123 @@ impl WgpuRenderer {
     }
 
     fn draw_textured_meshes(&self, meshes: &[TexturedMesh], pass: &mut wgpu::RenderPass<'_>) {
+        if meshes.is_empty() {
+            return;
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy, Pod, Zeroable)]
+        struct BatchedMeshVertexGpu {
+            clip: [f32; 4],
+            uv: [f32; 2],
+            color_params: [f32; 2],
+            content_mask: [f32; 4],
+        }
+        struct MeshRun {
+            texture_id: u32,
+            cull_back: bool,
+            index_start: u32,
+            index_count: u32,
+        }
+
         let resources = self.resources();
+        let total_vertices: usize = meshes.iter().map(|m| m.vertices.len()).sum();
+        let total_indices: usize = meshes.iter().map(|m| m.indices.len()).sum();
+        let mut all_vertices = Vec::with_capacity(total_vertices);
+        let mut all_indices = Vec::with_capacity(total_indices);
+        let mut runs: Vec<MeshRun> = Vec::new();
+        let mut texture_bind_groups: HashMap<u32, wgpu::BindGroup> = HashMap::new();
+
         for mesh in meshes {
-            // A texture that was not painted in this frame draws nothing.
             let Some(offscreen) = resources.offscreen_passes.get(&mesh.texture.0) else {
                 continue;
             };
-            // The pass is drawn in the top left of its (window-sized) texture: the vertices' texture points, in that.
+            if mesh.indices.is_empty() {
+                continue;
+            }
+            texture_bind_groups
+                .entry(mesh.texture.0)
+                .or_insert_with(|| self.create_texture_bind_group("offscreen_texture_bind_group", &offscreen.view));
             let (kx, ky) = (
                 offscreen.content.0 as f32 / offscreen.size.0.max(1) as f32,
                 offscreen.content.1 as f32 / offscreen.size.1.max(1) as f32,
             );
-            let vertices: Vec<MeshVertexGpu> = mesh
-                .vertices
-                .iter()
-                .map(|v| MeshVertexGpu {
-                    position: v.position,
-                    pad0: 0.0,
-                    uv: [v.uv[0] * kx, v.uv[1] * ky],
-                    pad1: [0.0; 2],
-                })
-                .collect();
+            let cull_back = mesh.flags & TexturedQuad::CULL_BACK != 0;
+            let base_vertex = all_vertices.len() as u32;
+            let t = &mesh.transform;
             let mask = mesh.content_mask.bounds;
-            let params = TexturedMeshParams {
-                transform: mesh.transform,
-                content_mask: [mask.origin.x.0, mask.origin.y.0, mask.size.width.0, mask.size.height.0],
-                opacity: mesh.opacity,
-                shade: mesh.shade,
-                flags: mesh.flags,
-                pad: 0,
-            };
-            let make_buffer = |label: &str, usage: wgpu::BufferUsages, bytes: &[u8]| {
-                let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(label),
-                    size: bytes.len() as u64,
-                    usage: usage | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
+            let content_mask = [mask.origin.x.0, mask.origin.y.0, mask.size.width.0, mask.size.height.0];
+            let color_params = [mesh.opacity, mesh.shade];
+            for v in mesh.vertices.iter() {
+                let x = v.position[0];
+                let y = v.position[1];
+                let z = v.position[2];
+                all_vertices.push(BatchedMeshVertexGpu {
+                    clip: [
+                        t[0] * x + t[4] * y + t[8] * z + t[12],
+                        t[1] * x + t[5] * y + t[9] * z + t[13],
+                        t[2] * x + t[6] * y + t[10] * z + t[14],
+                        t[3] * x + t[7] * y + t[11] * z + t[15],
+                    ],
+                    uv: [v.uv[0] * kx, v.uv[1] * ky],
+                    color_params,
+                    content_mask,
                 });
-                resources.queue.write_buffer(&buffer, 0, bytes);
-                buffer
-            };
-            let vertex_buffer = make_buffer("mesh_vertices", wgpu::BufferUsages::VERTEX, bytemuck::cast_slice(&vertices));
-            let index_buffer = make_buffer("mesh_indices", wgpu::BufferUsages::INDEX, bytemuck::cast_slice(mesh.indices.as_slice()));
-            let params_buffer = make_buffer("mesh_params", wgpu::BufferUsages::UNIFORM, bytemuck::bytes_of(&params));
-            let params_group = resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("textured_mesh_bind_group"),
-                layout: &resources.bind_group_layouts.textured_meshes,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() }],
-            });
-            let texture = self.create_texture_bind_group("offscreen_texture_bind_group", &offscreen.view);
-            pass.set_pipeline(if mesh.flags & TexturedQuad::CULL_BACK != 0 {
-                &resources.pipelines.textured_meshes_culled
+            }
+            let index_start = all_indices.len() as u32;
+            all_indices.extend(mesh.indices.iter().map(|&i| base_vertex + i));
+            let index_count = mesh.indices.len() as u32;
+
+            if let Some(last) = runs.last_mut().filter(|r| r.texture_id == mesh.texture.0 && r.cull_back == cull_back) {
+                last.index_count += index_count;
             } else {
-                &resources.pipelines.textured_meshes
+                runs.push(MeshRun {
+                    texture_id: mesh.texture.0,
+                    cull_back,
+                    index_start,
+                    index_count,
+                });
+            }
+        }
+
+        if runs.is_empty() {
+            return;
+        }
+
+        let make_buffer = |label: &str, usage: wgpu::BufferUsages, bytes: &[u8]| {
+            let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes.len() as u64,
+                usage: usage | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
-            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-            pass.set_bind_group(1, &params_group, &[]);
-            pass.set_bind_group(2, &texture, &[]);
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
+            resources.queue.write_buffer(&buffer, 0, bytes);
+            buffer
+        };
+        let vertex_buffer = make_buffer("mesh_vertices", wgpu::BufferUsages::VERTEX, bytemuck::cast_slice(&all_vertices));
+        let index_buffer = make_buffer("mesh_indices", wgpu::BufferUsages::INDEX, bytemuck::cast_slice(&all_indices));
+
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+
+        let mut last_cull: Option<bool> = None;
+        let mut last_texture: Option<u32> = None;
+        for run in runs {
+            if last_cull != Some(run.cull_back) {
+                pass.set_pipeline(if run.cull_back {
+                    &resources.pipelines.textured_meshes_culled
+                } else {
+                    &resources.pipelines.textured_meshes
+                });
+                last_cull = Some(run.cull_back);
+            }
+            if last_texture != Some(run.texture_id) {
+                if let Some(texture) = texture_bind_groups.get(&run.texture_id) {
+                    pass.set_bind_group(1, texture, &[]);
+                }
+                last_texture = Some(run.texture_id);
+            }
+            pass.draw_indexed(run.index_start..run.index_start + run.index_count, 0, 0..1);
         }
     }
 
